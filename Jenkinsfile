@@ -1,18 +1,10 @@
 pipeline {
     agent any
 
-    environment {
-        IMAGE_NAME  = 'ecommerce-api'
-        // Change to your Docker Hub username
-        REGISTRY_NS = 'your-dockerhub-username'
-        IMAGE_TAG   = "${env.BUILD_NUMBER}"
-    }
-
     options {
         timestamps()
         timeout(time: 20, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '10'))
-        disableConcurrentBuilds()
     }
 
     stages {
@@ -20,61 +12,46 @@ pipeline {
             steps { checkout scm }
         }
 
+        stage('Check Node') {
+            steps {
+                bat 'node -v'
+            }
+        }
+
         stage('Install') {
-            agent { docker { image 'node:20-alpine'; reuseNode true } }
-            steps { sh 'npm ci' }
+            steps { bat 'npm install' }
         }
 
         stage('Lint') {
-            agent { docker { image 'node:20-alpine'; reuseNode true } }
-            steps { sh 'npm run lint' }
+            steps { bat 'npm run lint' }
         }
 
         stage('Test') {
-            agent { docker { image 'node:20-alpine'; reuseNode true } }
-            steps { sh 'npm test' }
+            steps { bat 'npm test' }
             post {
-                always { junit 'junit.xml' }
+                always { junit allowEmptyResults: true, testResults: 'junit.xml' }
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Deploy Locally') {
             steps {
-                sh "docker build -t ${REGISTRY_NS}/${IMAGE_NAME}:${IMAGE_TAG} -t ${REGISTRY_NS}/${IMAGE_NAME}:latest ."
-            }
-        }
+                // Stop any older copy still using port 3000
+                bat returnStatus: true, script: '''powershell -Command "Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }"'''
 
-        stage('Push Image') {
-            when { branch 'main' }
-            steps {
-                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
-                                                  usernameVariable: 'DH_USER',
-                                                  passwordVariable: 'DH_PASS')]) {
-                    sh '''
-                      echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
-                      docker push ${REGISTRY_NS}/${IMAGE_NAME}:${IMAGE_TAG}
-                      docker push ${REGISTRY_NS}/${IMAGE_NAME}:latest
-                    '''
+                // Start the app in the background and keep it alive after the build ends
+                withEnv(['BUILD_ID=dontKillMe', 'JENKINS_NODE_COOKIE=dontKillMe']) {
+                    bat 'start "" /b node src/server.js'
                 }
-            }
-        }
 
-        stage('Deploy to Staging') {
-            when { branch 'main' }
-            steps {
-                sh '''
-                  docker rm -f ecommerce-staging || true
-                  docker run -d --name ecommerce-staging -p 3000:3000 ${REGISTRY_NS}/${IMAGE_NAME}:${IMAGE_TAG}
-                  sleep 5
-                  curl -f http://localhost:3000/health
-                '''
+                // Wait a few seconds, then check the app is up
+                bat 'ping -n 6 127.0.0.1 > nul'
+                bat '''powershell -Command "try { Invoke-WebRequest -UseBasicParsing http://localhost:3000/health | Out-Null } catch { exit 1 }"'''
             }
         }
     }
 
     post {
-        success { echo 'Pipeline succeeded.' }
+        success { echo 'Done! Open http://localhost:3000/products' }
         failure { echo 'Pipeline failed. Check the stage logs.' }
-        always  { cleanWs() }
     }
 }
